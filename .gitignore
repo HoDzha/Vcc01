@@ -1,0 +1,13 @@
+.env
+.venv/
+.idea/
+__pycache__/
+app/__pycache__/
+*.pyc
+
+backup.sqlite3
+users_backup.xlsx
+*.log
+
+users (1).csv
+postgree.yml
