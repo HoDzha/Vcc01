@@ -1,6 +1,6 @@
 import logging
+from pathlib import Path
 from threading import Thread
-from datetime import datetime
 
 import telebot
 from dotenv import load_dotenv
@@ -18,41 +18,40 @@ logging.basicConfig(
 
 logger_main = logging.getLogger("main")
 logger_handlers = logging.getLogger("handlers")
-logger_survey = logging.getLogger("survey")
+logger_form = logging.getLogger("request_form")
 logger_backup = logging.getLogger("excel_backup")
 logger_sqlite = logging.getLogger("sqlite_backup")
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(PROJECT_ROOT / ".env")
 
 bot_config = get_bot_config()
 db_config = get_database_config()
 db_client = DatabaseClient(db_config)
 
 DB_SCHEMA = "public"
-DB_TABLE = "users"
+DB_TABLE = "it_team_requests"
 
 excel_client = ExcelBackupClient.with_default_path()
 sqlite_client = SqliteBackupClient.with_default_path(table_name=DB_TABLE)
 
-logger_main.info("Telegram bot initialization started")
-logger_main.info("Configured database target: %s.%s", DB_SCHEMA, DB_TABLE)
-logger_main.info("Configured Excel backup file: %s", excel_client.file_path.name)
-logger_main.info("Configured SQLite backup file: %s", sqlite_client.file_path.name)
-
 bot = telebot.TeleBot(bot_config.token, parse_mode="HTML")
 form_sessions: dict[int, dict[str, str]] = {}
 
-BTN_START_FORM = "📝 Пройти еще ..."
-BTN_MY_FORMS = "📚 Мои анкеты"
+PRIORITIES = ["Низкий", "Средний", "Высокий", "Критический"]
+STATUSES = ["Новая", "В работе", "На паузе", "Выполнена"]
+
+BTN_CREATE_REQUEST = "🛠️ Новая заявка"
+BTN_MY_REQUESTS = "📋 Последние заявки"
 BTN_MAIN_MENU = "🏠 Главное меню"
-BTN_CANCEL_FORM = "❌ Отменить опрос"
+BTN_CANCEL_FORM = "❌ Отменить"
 
 
 def build_main_menu_keyboard() -> types.ReplyKeyboardMarkup:
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     keyboard.add(
-        types.KeyboardButton(BTN_START_FORM),
-        types.KeyboardButton(BTN_MY_FORMS),
+        types.KeyboardButton(BTN_CREATE_REQUEST),
+        types.KeyboardButton(BTN_MY_REQUESTS),
         types.KeyboardButton(BTN_MAIN_MENU),
     )
     return keyboard
@@ -64,146 +63,133 @@ def build_cancel_keyboard() -> types.ReplyKeyboardMarkup:
     return keyboard
 
 
+def build_priority_keyboard() -> types.ReplyKeyboardMarkup:
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    for priority in PRIORITIES:
+        keyboard.add(types.KeyboardButton(priority))
+    keyboard.add(types.KeyboardButton(BTN_CANCEL_FORM))
+    return keyboard
+
+
+def build_status_keyboard() -> types.ReplyKeyboardMarkup:
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    for status in STATUSES:
+        keyboard.add(types.KeyboardButton(status))
+    keyboard.add(types.KeyboardButton(BTN_CANCEL_FORM))
+    return keyboard
+
+
 @bot.message_handler(commands=["start", "help"])
 def handle_start(message: telebot.types.Message) -> None:
-    logger_handlers.info("User %s requested /start or /help", message.from_user.id if message.from_user else "unknown")
     text = (
-        "Привет! Я помогу заполнить короткую анкету.\n\n"
+        "Привет! Я бот заявок для IT-команды.\n\n"
         "Команды:\n"
-        "/form - начать опрос\n"
-        "/schema - структура таблиц БД\n"
-        "/backup_status - выгрузить всю таблицу в Excel\n"
-        "/cancel - отменить текущий опрос"
+        "/request - создать заявку\n"
+        "/list - показать последние заявки\n"
+        "/schema - показать структуру БД\n"
+        "/backup_status - выгрузить таблицу в Excel\n"
+        "/cancel - отменить заполнение"
     )
     bot.send_message(message.chat.id, text, reply_markup=build_main_menu_keyboard())
 
 
+@bot.message_handler(commands=["request"])
+def handle_request_start(message: telebot.types.Message) -> None:
+    user_id = message.from_user.id
+    form_sessions[user_id] = {"step": "task"}
+    bot.send_message(
+        message.chat.id,
+        "Шаг 1/4. Опишите задачу для IT-команды:",
+        reply_markup=build_cancel_keyboard(),
+    )
+
+
+@bot.message_handler(commands=["cancel"])
+def handle_cancel(message: telebot.types.Message) -> None:
+    user_id = message.from_user.id
+    if user_id in form_sessions:
+        form_sessions.pop(user_id, None)
+        bot.send_message(message.chat.id, "Заполнение отменено.", reply_markup=build_main_menu_keyboard())
+        return
+
+    bot.send_message(message.chat.id, "Активной формы нет.", reply_markup=build_main_menu_keyboard())
+
+
 @bot.message_handler(commands=["schema"])
 def handle_schema(message: telebot.types.Message) -> None:
-    logger_handlers.info("User %s requested /schema", message.from_user.id if message.from_user else "unknown")
     try:
-        schema_text = db_client.get_schema_overview_text(schema="public")
+        schema_text = db_client.get_schema_overview_text(schema=DB_SCHEMA)
         if len(schema_text) > 4000:
             schema_text = schema_text[:3950] + "\n\n... (сообщение сокращено)"
         bot.send_message(message.chat.id, f"<b>Структура БД:</b>\n<pre>{schema_text}</pre>")
     except Exception as exc:
-        logging.exception("Failed to read database schema.")
-        bot.send_message(
-            message.chat.id,
-            f"Не удалось получить структуру БД: <code>{exc}</code>",
-        )
+        logger_handlers.exception("Failed to load schema")
+        bot.send_message(message.chat.id, f"Не удалось получить схему БД: <code>{exc}</code>")
 
 
-@bot.message_handler(commands=["form"])
-def handle_form_start(message: telebot.types.Message) -> None:
-    user_id = message.from_user.id
-    logger_handlers.info("User %s started form", user_id)
-    form_sessions[user_id] = {"step": "full_name"}
-    bot.send_message(
-        message.chat.id,
-        "Вопрос 1 из 2:\n"
-        "Как тебя зовут? (Введите ваше ФИО)\n\n"
-        "Пример: Иванов Иван Иванович",
-        reply_markup=build_cancel_keyboard(),
-    )
+@bot.message_handler(commands=["list"])
+def handle_list(message: telebot.types.Message) -> None:
+    try:
+        rows = db_client.get_recent_requests(limit=10, schema=DB_SCHEMA, table_name=DB_TABLE)
+        if not rows:
+            bot.send_message(message.chat.id, "Заявок пока нет.", reply_markup=build_main_menu_keyboard())
+            return
+
+        lines = ["📋 Последние заявки:"]
+        for row in rows:
+            lines.append(
+                f"#{row['id']} | {row['priority']} | {row['status']}\n"
+                f"Автор: {row['author']}\n"
+                f"Задача: {row['task']}"
+            )
+        bot.send_message(message.chat.id, "\n\n".join(lines), reply_markup=build_main_menu_keyboard())
+    except Exception as exc:
+        logger_handlers.exception("Failed to get requests list")
+        bot.send_message(message.chat.id, f"Не удалось получить список заявок: <code>{exc}</code>")
 
 
 @bot.message_handler(commands=["backup_status"])
 def handle_backup_status(message: telebot.types.Message) -> None:
     chat_id = message.chat.id
-    user_id = message.from_user.id if message.from_user else "unknown"
-    logger_backup.info("User %s requested /backup_status", user_id)
-    bot.send_message(chat_id, "Запускаю полную выгрузку из БД в Excel...")
+    bot.send_message(chat_id, "Запускаю выгрузку заявок в Excel...")
 
     def run_full_backup() -> None:
         try:
-            logger_backup.info("Full backup started for %s.%s", DB_SCHEMA, DB_TABLE)
             column_order = db_client.get_table_column_names(table_name=DB_TABLE, schema=DB_SCHEMA)
             rows = db_client.get_all_table_rows(table_name=DB_TABLE, schema=DB_SCHEMA)
             excel_client.replace_with_rows(rows=rows, column_order=column_order)
-            logger_backup.info("Full backup completed rows=%s", len(rows))
             bot.send_message(
                 chat_id,
                 "✅ Резервная копия обновлена.\n"
                 f"Таблица: <code>{DB_SCHEMA}.{DB_TABLE}</code>\n"
-                f"Строк экспортировано: <b>{len(rows)}</b>\n"
+                f"Строк: <b>{len(rows)}</b>\n"
                 f"Файл: <code>{excel_client.file_path.name}</code>",
                 reply_markup=build_main_menu_keyboard(),
             )
         except Exception as exc:
-            logger_backup.exception("Failed to run full Excel backup.")
+            logger_backup.exception("Failed to backup table")
             bot.send_message(
                 chat_id,
-                f"Не удалось обновить резервную копию: <code>{exc}</code>",
+                f"Не удалось сделать backup: <code>{exc}</code>",
                 reply_markup=build_main_menu_keyboard(),
             )
 
     Thread(target=run_full_backup, daemon=True).start()
 
 
-@bot.message_handler(commands=["cancel"])
-def handle_form_cancel(message: telebot.types.Message) -> None:
-    user_id = message.from_user.id
-    logger_handlers.info("User %s requested /cancel", user_id)
-    if user_id in form_sessions:
-        form_sessions.pop(user_id, None)
-        bot.send_message(
-            message.chat.id,
-            "Опрос отменен.",
-            reply_markup=build_main_menu_keyboard(),
-        )
-        return
-
-    bot.send_message(
-        message.chat.id,
-        "Активного опроса нет.",
-        reply_markup=build_main_menu_keyboard(),
-    )
+@bot.message_handler(func=lambda message: (message.text or "").strip() == BTN_CREATE_REQUEST)
+def handle_request_button(message: telebot.types.Message) -> None:
+    handle_request_start(message)
 
 
-@bot.message_handler(func=lambda message: (message.text or "").strip() == BTN_START_FORM)
-def handle_form_button(message: telebot.types.Message) -> None:
-    logger_handlers.info("User %s clicked start form button", message.from_user.id if message.from_user else "unknown")
-    handle_form_start(message)
+@bot.message_handler(func=lambda message: (message.text or "").strip() == BTN_MY_REQUESTS)
+def handle_list_button(message: telebot.types.Message) -> None:
+    handle_list(message)
 
 
 @bot.message_handler(func=lambda message: (message.text or "").strip() == BTN_MAIN_MENU)
 def handle_main_menu_button(message: telebot.types.Message) -> None:
-    logger_handlers.info("User %s opened main menu", message.from_user.id if message.from_user else "unknown")
     handle_start(message)
-
-
-@bot.message_handler(func=lambda message: (message.text or "").strip() == BTN_MY_FORMS)
-def handle_my_forms(message: telebot.types.Message) -> None:
-    logger_handlers.info("User %s requested recent forms", message.from_user.id if message.from_user else "unknown")
-    try:
-        rows = db_client.get_recent_survey_rows(limit=5, schema=DB_SCHEMA, table_name=DB_TABLE)
-        if not rows:
-            bot.send_message(
-                message.chat.id,
-                "Пока нет сохраненных анкет.",
-                reply_markup=build_main_menu_keyboard(),
-            )
-            return
-
-        lines = ["📚 Последние анкеты:"]
-        for row in rows:
-            full_name = row.get("full_name", "—")
-            birth_date = row.get("birtdate") or row.get("birthdate") or row.get("birth_date") or "—"
-            lines.append(f"• {full_name} | {birth_date}")
-
-        bot.send_message(
-            message.chat.id,
-            "\n".join(lines),
-            reply_markup=build_main_menu_keyboard(),
-        )
-    except Exception as exc:
-        logger_handlers.exception("Failed to read recent surveys.")
-        bot.send_message(
-            message.chat.id,
-            f"Не удалось получить анкеты: <code>{exc}</code>",
-            reply_markup=build_main_menu_keyboard(),
-        )
 
 
 @bot.message_handler(func=lambda message: message.from_user and message.from_user.id in form_sessions)
@@ -213,110 +199,98 @@ def handle_form_steps(message: telebot.types.Message) -> None:
     if state is None:
         return
 
-    step = state.get("step")
     text = (message.text or "").strip()
-    logger_survey.info("Received form input from user=%s step=%s", user_id, step)
-
     if text == BTN_CANCEL_FORM:
         form_sessions.pop(user_id, None)
-        bot.send_message(
-            message.chat.id,
-            "Опрос отменен.",
-            reply_markup=build_main_menu_keyboard(),
-        )
+        bot.send_message(message.chat.id, "Заполнение отменено.", reply_markup=build_main_menu_keyboard())
         return
 
-    if step == "full_name":
-        if len(text) < 3:
-            logger_survey.warning("Invalid full name from user=%s", user_id)
-            bot.send_message(message.chat.id, "Введите корректное ФИО.")
+    step = state.get("step")
+    logger_form.info("Received step=%s from user=%s", step, user_id)
+
+    if step == "task":
+        if len(text) < 5:
+            bot.send_message(message.chat.id, "Опишите задачу подробнее (минимум 5 символов).")
             return
 
-        state["full_name"] = text
-        state["step"] = "birth_date"
-        logger_survey.info("Accepted full name for user=%s", user_id)
-        bot.send_message(
-            message.chat.id,
-            "✅ Принято: <b>{}</b>\n\n"
-            "Вопрос 2 из 2:\n"
-            "Какая ваша дата рождения?\n\n"
-            "Введите в формате: ДД.ММ.ГГГГ\n"
-            "Пример: 01.01.2001".format(text),
-            reply_markup=build_cancel_keyboard(),
-        )
+        state["task"] = text
+        state["step"] = "priority"
+        bot.send_message(message.chat.id, "Шаг 2/4. Выберите приоритет:", reply_markup=build_priority_keyboard())
         return
 
-    if step == "birth_date":
-        try:
-            birth_date = datetime.strptime(text, "%d.%m.%Y").date()
-        except ValueError:
-            logger_survey.warning("Invalid birth date format from user=%s value=%s", user_id, text)
+    if step == "priority":
+        if text not in PRIORITIES:
             bot.send_message(
                 message.chat.id,
-                "Неверный формат даты.\nВведите: ДД.ММ.ГГГГ (например 01.01.2001)",
-                reply_markup=build_cancel_keyboard(),
+                "Выберите приоритет кнопкой ниже.",
+                reply_markup=build_priority_keyboard(),
             )
             return
 
-        full_name = state.get("full_name", "").strip()
-        if not full_name:
-            form_sessions.pop(user_id, None)
-            bot.send_message(message.chat.id, "Сессия опроса сброшена. Запусти /form заново.")
+        state["priority"] = text
+        state["step"] = "author"
+        bot.send_message(message.chat.id, "Шаг 3/4. Укажите автора заявки:", reply_markup=build_cancel_keyboard())
+        return
+
+    if step == "author":
+        if len(text) < 2:
+            bot.send_message(message.chat.id, "Введите корректное имя автора.")
             return
 
-        try:
-            tg_user = message.from_user
-            tg_user_id = tg_user.id
-            tg_username = tg_user.username or ""
+        state["author"] = text
+        state["step"] = "status"
+        bot.send_message(message.chat.id, "Шаг 4/4. Выберите статус:", reply_markup=build_status_keyboard())
+        return
 
-            saved_row = db_client.insert_survey_record(
-                user_id=tg_user_id,
-                username=tg_username,
-                full_name=full_name,
-                birth_date=birth_date,
+    if step == "status":
+        if text not in STATUSES:
+            bot.send_message(message.chat.id, "Выберите статус кнопкой ниже.", reply_markup=build_status_keyboard())
+            return
+
+        state["status"] = text
+        tg_user = message.from_user
+
+        try:
+            saved_row = db_client.insert_request_record(
+                task=state["task"],
+                priority=state["priority"],
+                author=state["author"],
+                status=state["status"],
+                telegram_user_id=tg_user.id,
+                telegram_username=tg_user.username,
                 schema=DB_SCHEMA,
                 table_name=DB_TABLE,
             )
-            logger_survey.info("Survey data saved to DB for user=%s", tg_user_id)
 
             def backup_to_sqlite() -> None:
                 try:
-                    logger_sqlite.info("Background SQLite backup started user=%s", tg_user_id)
                     columns = db_client.get_table_columns(table_name=DB_TABLE, schema=DB_SCHEMA)
                     sqlite_client.backup_row(row_data=saved_row, columns=columns)
-                    logger_sqlite.info("Background SQLite backup completed user=%s", tg_user_id)
                 except Exception:
-                    logger_sqlite.exception("Failed to backup survey row to SQLite.")
+                    logger_sqlite.exception("Failed to backup request to SQLite")
 
             Thread(target=backup_to_sqlite, daemon=True).start()
 
             bot.send_message(
                 message.chat.id,
-                "🎉 <b>Опрос завершен!</b>\n\n"
-                "✅ <b>Ваши данные:</b>\n"
-                f"👤 ФИО: {full_name}\n"
-                f"🎂 Дата рождения: {text}\n\n"
-                "Данные успешно сохранены в базу данных!",
+                "✅ Заявка создана!\n\n"
+                f"ID: <b>{saved_row['id']}</b>\n"
+                f"Задача: {saved_row['task']}\n"
+                f"Приоритет: {saved_row['priority']}\n"
+                f"Автор: {saved_row['author']}\n"
+                f"Статус: {saved_row['status']}",
                 reply_markup=build_main_menu_keyboard(),
             )
         except Exception as exc:
-            logger_survey.exception("Failed to save form data for user=%s", user_id)
-            bot.send_message(
-                message.chat.id,
-                f"Не удалось сохранить данные: <code>{exc}</code>",
-                reply_markup=build_main_menu_keyboard(),
-            )
+            logger_form.exception("Failed to create request")
+            bot.send_message(message.chat.id, f"Не удалось создать заявку: <code>{exc}</code>")
         finally:
             form_sessions.pop(user_id, None)
 
 
 def main() -> None:
-    logger_main.info("Starting bot polling")
-    try:
-        me = bot.get_me()
-        logger_main.info("Bot initialized as @%s (%s)", me.username, me.first_name)
-    except Exception:
-        logger_main.exception("Unable to get bot profile during startup.")
+    logger_main.info("Starting bot for table %s.%s", DB_SCHEMA, DB_TABLE)
+    db_client.ensure_requests_table(schema=DB_SCHEMA, table_name=DB_TABLE)
     bot.infinity_polling(skip_pending=True)
 
 
