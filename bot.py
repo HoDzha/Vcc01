@@ -1,6 +1,7 @@
 import logging
 from threading import Thread
 from datetime import datetime
+import html
 
 import telebot
 from dotenv import load_dotenv
@@ -186,15 +187,41 @@ def handle_my_forms(message: telebot.types.Message) -> None:
             )
             return
 
-        lines = ["📚 Последние анкеты:"]
+        lines = ["📚 <b>Последние анкеты:</b>"]
         for row in rows:
-            full_name = row.get("full_name", "—")
+            full_name = html.escape(str(row.get("full_name") or "—"))
             birth_date = row.get("birtdate") or row.get("birthdate") or row.get("birth_date") or "—"
-            lines.append(f"• {full_name} | {birth_date}")
+            city = html.escape(str(row.get("city") or "—"))
+            profession = html.escape(str(row.get("profession") or "—"))
+            hobby = html.escape(str(row.get("hobby") or "—"))
+            random_number = row.get("random_number", "—")
+            random_score = row.get("random_score", "—")
+            is_active = row.get("is_active", "—")
+            random_color = html.escape(str(row.get("random_color") or "—"))
+
+            lines.append(
+                "• <b>{}</b>\n"
+                "  🎂 {}\n"
+                "  🏙 {}\n"
+                "  💼 {}\n"
+                "  🎯 {}\n"
+                "  🔢 {} | ⭐ {} | ✅ {}\n"
+                "  🎨 {}".format(
+                    full_name,
+                    birth_date,
+                    city,
+                    profession,
+                    hobby,
+                    random_number,
+                    random_score,
+                    is_active,
+                    random_color,
+                )
+            )
 
         bot.send_message(
             message.chat.id,
-            "\n".join(lines),
+            "\n\n".join(lines),
             reply_markup=build_main_menu_keyboard(),
         )
     except Exception as exc:
